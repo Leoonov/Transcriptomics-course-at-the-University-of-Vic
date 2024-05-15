@@ -1,0 +1,640 @@
+---
+title: "Transcriptomics in R practical (Summary report) | UVic-UCC, 2023-24"
+author: "Vadim Leonov"
+date: "`r Sys.Date()`"
+output:
+  BiocStyle::html_document:
+    theme: spacelab
+    number_sections: yes
+    toc_float: yes
+    toc_depth: 3
+ 
+
+---
+<style type="text/css">
+
+h1.title {
+  text-align: center;
+  margin-top: 60px;
+  margin-bottom: 30px;
+}
+h4.author {
+  text-align: center;
+}
+h4.date {
+  text-align: center;
+}
+
+img + em {
+    display: inherit;
+    text-align: center;
+    font-size: 8pt;
+    color: #1a81c2;
+    font-style: inherit;
+    font-weight: bold;
+}
+
+.table {
+    max-width: 600px;
+}
+
+</style>
+---
+
+
+# **Loading the chosen dataset**
+```{r, echo = FALSE, warnings = FALSE, message = FALSE, results='hide'}
+knitr::opts_chunk$set(echo = FALSE, warnings = FALSE, message = FALSE)
+
+suppressWarnings({
+library(BiocStyle) #to style report
+
+#General purposes and plot libraries
+library(GEOquery)
+library(readr)
+library(biomaRt)
+library(readxl)
+
+library(tidyverse)
+library(ggrepel)
+library(ggfortify) #for PCA
+library(pheatmap)
+
+# DEA
+library(limma)
+library(edgeR)
+})
+
+```
+
+
+
+```{r, echo=F, warings=F}
+wd <- "C:/Users/M0sa2/Desktop/Transcriptomics/Practical"
+setwd(wd)
+```
+
+
+```{r, echo=T, warings=F}
+#Data set presentation
+gseid<-"GSE162729" #RNA-seq GPL11154	Illumina HiSeq 2000 (Homo sapiens)
+gse <- getGEO(gseid, GSEMatrix=TRUE)[[1]] 
+```
+**Comment:** GSE162729 includes a dataset of 12 samples, presenting gene expression profiles for macrophages infected with distinct strains of Mycobacterium tuberculosis (BCG, H37Rv, and H37Ra), serving as three conditions for downstream analysis. The study, conducted by Pu and colleagues (Pu et al., 2021), aimed to explore global transcriptome changes in macrophages during infection with various strains of tuberculosis.
+
+```{r, echo=T, warings=F}
+
+pheno <- pData(gse)
+
+pheno <- pData(gse)[, c('title', 'characteristics_ch1.1')]
+colnames(pheno) <- c("Condition", "Description")
+
+phenoN <- data.frame(
+  sampleGEO = rownames(pheno),
+  Condition = sub("Condition: (.*)", "\\1", pheno$Condition),
+  Description = sub("Description: (.*)", "\\1", pheno$Description)
+)
+
+
+cond <- c(rep('Ctr', 3), rep('H37Rv', 3),  rep('H37Ra', 3), rep('BCG', 3))
+
+phenoN$cond<-cond
+
+phenoN$sampleName <- paste(phenoN$Condition,phenoN$Description, sep="_")
+row.names(phenoN)=phenoN$sampleName
+
+dim(phenoN)
+phenoN
+```
+
+```{r, echo=T, warings=F}
+gseSupp <- getGEOSuppFiles(gseid, makeDirectory = TRUE)
+setwd(file.path(wd,gseid))
+
+countsO <- read_excel("GSE162729_Processed_data.xlsx") #manually load xsl file
+
+countsM<-as.matrix(countsO[,c("Control_1 Read Count","Control_2 Read Count","Control_3 Read Count","H37Rv_1 Read Count","H37Rv_2 Read Count", "H37Rv_3 Read Count",     "H37Ra_1 Read Count",     "H37Ra_2 Read Count",     "H37Ra_3 Read Count",   "BCG_1 Read Count", "BCG_2 Read Count",      "BCG_3 Read Count")])
+
+#we assume the order is the same
+rownames(countsM) <- countsO$'Gene Symbol'
+
+countsM[is.na(countsM)] = 0 #all NA values are replaced now by zero in countsM
+
+
+```
+**Comment:** The transcriptomic dataset from the GSE162729 (www.ncbi.nlm.nih.gov) series was processed in R using the GEOquery package from Bioconductor. Upon setting the GSE ID, the getGEO function retrieved the dataset, yielding a list where the initial element contains expression data stored as an eSet. Phenotype data associated with the expression data was organized and formatted, leading to the creation of a new dataframe, phenoN, to store sample information with assigned conditions.
+
+Supplementary files were obtained using getGEOSuppFiles, and the working directory was adjusted accordingly. Expression data from the "GSE162729_Processed_data.xlsx" file was read and processed manually, resulting in a matrix (countsM) with specific columns representing sample read counts. This thorough approach ensures the successful processing of the dataset, laying the foundation for subsequent analyses and interpretation. 
+
+Note: The original dataset contained a significant number of missing values in expression data, necessitating their replacement with zero. Despite an exhaustive review, we could not identify a conclusive explanation for the prevalence of missing values, even after consulting the original publication (Pu et al., 2021). The presence of these missing values could be attributed to various factors, including technical issues during sample preparation, RNA extraction, library preparation, or sequencing, as well as biological variability and low expression levels of specific genes. The decision to replace missing values with zeros is a common practice, assuming that the absence of a signal corresponds to zero expression. It is crucial to acknowledge the potential impact of such data preprocessing steps on downstream analyses and interpretations.
+
+
+
+
+
+
+# **Exploration and filtration**
+```{r, echo=T, warings=F}
+#Exploration
+sampleT <- apply(countsM, 2, sum)/10^6
+sampleT
+
+range(sampleT)
+
+sampleTDF <- data.frame(sample=names(sampleT), total=sampleT)
+
+p <- ggplot(aes(x=sample, y=sampleT, fill=sampleT), data=sampleTDF) + 
+  geom_bar(stat="identity") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  ylab("") +
+  scale_fill_viridis_c(option = "D")
+
+p
+
+```
+```{r, echo=T, warings=F}
+#Filtering
+dim(countsM) 
+keep <- rowSums(countsM > 10) >= 6# at least 6 samples have 10 reads per gene
+countsF <- countsM[keep,]
+dim(countsF) 
+
+
+```
+**Comment:** The exploratory analysis of the gene expression dataset involved the calculation of sample totals, represented by the variable sampleT. This metric was computed by summing the counts for each sample and normalizing to a million reads. The range of sample totals was then assessed, revealing the variability in the overall expression levels across the samples. The results were organized into a dataframe, sampleTDF, capturing sample names and their corresponding total counts. A bar plot visualization was generated using ggplot2, depicting the distribution of sample totals. Most samples have almost equal read counts (around 16-17), the darker color for "H37Rv_3 Read Count" corresponds to the lowest number of read counts (around 13) for the sample.
+In the filtering stage of the gene expression analysis, the initial dataset, represented by a matrix countsM with dimensions 19965x12, was subjected to a rigorous filtering criterion. Genes were retained if they demonstrated a minimum threshold of 10 reads in at least 6 samples since we have 12 samples and 3 conditions to ensure that genes are consistently expressed across a reasonable subset of conditions. The filtering operation resulted in a refined dataset, countsF, with reduced dimensions of 13196x12. This filtration process ensures a focus on genes that exhibit a more consistent and substantial expression across multiple samples, streamlining the dataset for subsequent analyses.
+
+
+# **Normalization**
+
+**1. Gene length**
+```{r, echo=F, warings=F}
+listEnsemblArchives()
+```
+
+
+```{r, echo=F, warings=F}
+listEnsembl(version = 75)
+```
+
+```{r, echo=F, warings=F}
+ensembl75 <- useEnsembl(biomart = 'genes', 
+                       dataset = 'hsapiens_gene_ensembl',
+                       version = 75)
+
+head(listAttributes(ensembl75))
+```
+
+```{r, echo=F, warings=F}
+searchFilters(mart = ensembl75, pattern = "ensembl.*id")
+```
+
+```{r, echo=F, warings=F}
+searchAttributes(mart = ensembl75, pattern = "position")
+```
+
+
+
+```{r, echo=F, warings=F}
+searchAttributes(mart = ensembl75, pattern = "length")
+```
+
+
+```{r, echo=F, warings=F}
+searchAttributes(mart = ensembl75, pattern = "position")
+```
+
+
+
+```{r, echo=T, warings=F}
+
+gensInfo<-getBM(attributes=c("hgnc_symbol","chromosome_name","start_position","end_position"), 
+                filters=c("hgnc_symbol"),
+                values=list(rownames(countsF)), mart=ensembl75)
+
+gensInfo$length <- gensInfo$end_position - gensInfo$start_position
+range(gensInfo$length) 
+
+```
+```{r, echo=T, warings=F}
+dim(gensInfo) 
+```
+```{r, echo=T, warings=F}
+table(duplicated(gensInfo$hgnc_symbol))
+```
+
+```{r, echo=FALSE, warnings=FALSE, results='hide'}
+gensInfo[duplicated(gensInfo$hgnc_symbol),]
+```
+
+```{r, echo=T, warings=F}
+# choose the setdiff function from the base package
+setdiff_base <- base::setdiff
+
+length(setdiff_base(rownames(countsF), gensInfo$hgnc_symbol)) 
+
+```
+
+
+```{r, echo=T, warings=F}
+countsFDF <- data.frame(ID=rownames(countsF),countsF)
+countsFInfo <- right_join(countsFDF, gensInfo, by=c("ID"="hgnc_symbol")) 
+countsFInfo <- countsFInfo[!duplicated(countsFInfo$ID),] #after having checked duplications, just keep first result
+
+any(is.na(countsFInfo[, c("Control_1.Read.Count","Control_2.Read.Count","Control_3.Read.Count","H37Rv_1.Read.Count","H37Rv_2.Read.Count", "H37Rv_3.Read.Count",     "H37Ra_1.Read.Count",     "H37Ra_2.Read.Count",     "H37Ra_3.Read.Count",   "BCG_1.Read.Count", "BCG_2.Read.Count",      "BCG_3.Read.Count")]))
+countsFInfo[is.na(countsFInfo)] <- 0  # Replace NAs with zeros as a simple approach
+head(countsFInfo)
+
+```
+
+**Comment:** To normalize using FPKM, and TPM we need the gene length. TMM  does not directly incorporate gene length into its normalization strategy. Instead, TMM focuses on estimating a scaling factor that can be applied to each sample to make their library sizes comparable. Normalizing gene expression data by gene length is a common step in RNA-seq analysis. The rationale behind this normalization is to account for the differences in the lengths of genes when comparing their expression levels. The number of reads obtained for a gene in RNA-seq experiments is affected by both the expression level of the gene and the gene's length.
+
+Overall, the gene lengths range from 26 to 2304637, gensInfo has 13965 rows and 5 columns, each row corresponds to information about a specific gene, and the columns include various attributes associated with each gene. In the countsF matrix is  735 genes whose names are not found in the hgnc_symbol column of the gensInfo data frame. The presence of duplicated genes (1505) in the dataset might be due to multiple transcripts or splicing variants for some genes, leading to different entries in the dataset with the same HGNC symbol.
+
+Despite the fact that TPM is more popular to apply for normalization here for educational  purposes we used FPKM, TMM and TPM. Additionally, TMM is suitable for comparing among the samples that we will use in downstream analysis for hierarchical clustering and PCA.
+
+**2. FPKM**
+
+```{r, echo=T, warings=F}
+#step 1: normalize for read depth and multiply by million
+readD <- apply(countsFInfo[,2:13], 2, function(x) x / sum(x) * 10^6) 
+
+#step 2. scale by gene length and multiply by thousand
+countsFPKM <- readD / countsFInfo$length * 10^3
+
+head(countsFPKM)
+
+
+```
+```{r, echo=T, warings=F}
+colSums(countsFPKM)
+
+```
+
+
+**3. TPM**
+```{r, echo=T, warings=F}
+#step 1: divide by gene length and multiply by thousand to obtain the reads per kilobase (RPK) 
+rpk <- countsFInfo[,2:13] / countsFInfo$length * 10^3
+
+#step 2: divide by sequencing depth and multiply by million
+countsTPM <- apply(rpk, 2, function(x) x / sum(x) * 10^6)
+
+#check totals
+colSums(countsTPM)
+```
+
+
+
+**4. TMM**
+```{r, echo=T, warings=F}
+#Normalization using TMM (edgeR package)
+d <- DGEList(counts = countsF)
+Norm.Factor <- calcNormFactors(d, method = "TMM")
+countsTMM <- cpm(Norm.Factor, log = T)
+
+countsTMMnoLog <- cpm(Norm.Factor, log = F) 
+```
+
+
+
+
+```{r, echo=T, warings=F}
+hist(log2(countsFPKM[,1]+2), xlab="log2-ratio", main="FPKM")
+hist(log2(countsTPM[,1]+2), xlab="log2-ratio", main="TPM") 
+hist(countsTMM[,1], xlab="log2-ratio", main="TMM") 
+```
+
+**Comment:** Obtained histograms provide insights into the distribution of log2-transformed FPKM, TMM, and TPM values. The presence of a peak(s) around suggests a subgroup of genes with higher expression levels, while the gradual decrease indicates the distribution of expression levels for the majority of genes. There is no outliers or unusual patterns that may need further corrections.Overall pattern can be observed - most genes centered around a certain value representing uniform distribution.  
+
+
+# **Sample aggregation**
+
+**1. Hierarchical clustering**
+
+```{r, echo=T, warings=F}
+x<-countsTMM
+
+#Euclidean distance
+clust.cor.ward <- hclust(dist(t(x)),method="ward.D2")
+plot(clust.cor.ward, main="hierarchical clustering", hang=-1,cex=0.8)
+
+```
+
+
+```{r, echo=T, warings=F}
+clust.cor.average <- hclust(dist(t(x)),method="average")
+plot(clust.cor.average, main="hierarchical clustering", hang=-1,cex=0.8)
+```
+
+```{r, echo=T, warings=F}
+clust.cor.average <- hclust(dist(t(x)),method="complete")
+plot(clust.cor.average, main="hierarchical clustering", hang=-1,cex=0.8)
+```
+
+
+```{r, echo=T, warings=F}
+#Correlation based distance
+clust.cor.ward <- hclust(as.dist(1-cor(x)),method="ward.D2")
+plot(clust.cor.ward, main="hierarchical clustering", hang=-1,cex=0.8)
+```
+
+```{r, echo=T, warings=F}
+clust.cor.average<- hclust(as.dist(1-cor(x)),method="average")
+plot(clust.cor.average, main="hierarchical clustering", hang=-1,cex=0.8)
+```
+**Comment:** The sample aggregation is quite homogeneous and samples aggregate by M.tuberculosis strains samples. Notably, sample H37Rv_3 separately aggregates from the rest of repeats for the strain. 
+
+
+
+**2. PCA**
+```{r, echo=T, warings=F}
+summary(pca.filt <- prcomp(t(x), scale=T ))
+```
+```{r, echo=T, warings=F}
+autoplot(pca.filt, data=phenoN, colour="cond")
+```
+**Comment:**  A two-dimensional scatter plot of PCA represents the relationships between samples of macrophages - infected and uninfected. The X-axis corresponds to PC1 (PCA Component 1), capturing 33.72% of the variance, while the Y-axis represents PC2 (PCA Component 2) with 22.36% variance. Control samples are clustered separately from other groups. The single repeat for the H37Rv_3 condition is distinctively located apart from the remaining two repeats for the strain. This separation appears to be meaningful for the experiment, and accordingly, we have decided to keep the sample.
+
+
+#  **Differential expression analysis**
+
+**voom + limma**
+
+```{r, echo=T, warings=F}
+dim(countsF)
+cond <- as.factor(phenoN$cond)
+
+# design matrix
+design <- model.matrix(~0+cond)
+rownames(design) <- phenoN$sampleName
+colnames(design) <- gsub("cond", "", colnames(design))
+
+voom.res <- voom(countsF, design, plot = T) 
+```
+**Comment:** To estimate the mean-variance relationship in count data, we utilized the voom function from the limma package. This function generates diagnostic plots, such as the Bland-Altman plot, which illustrates the relationship between the standard deviation (Sd) and the log-fold change of gene expression levels. The X-axis of our output reveals an absence of counts near zero with low Sd, indicating effective data filtering.
+
+ 
+
+
+```{r, echo=T, warings=F}
+# model fit
+fit <- lmFit(voom.res, design) 
+
+# contrasts
+contrast.matrix <- makeContrasts(con1=Ctr-BCG,
+                                 con2=Ctr-H37Ra,
+                                 con3=Ctr-H37Rv,
+                                 levels = design) 
+
+# contrasts fit and Bayesian adjustment
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fite <- eBayes(fit2)
+
+#plot final model
+plotSA(fite, main="Final model: Variance trend", ylab = "Sqrt( standard deviation )", xlab = "Mean log-count expression")
+
+# summary 
+summary(decideTests(fite, method = "separate"))
+```
+
+```{r, echo=T, warings=F}
+#global model
+top.table <- topTable(fite, number = Inf, adjust = "fdr")
+```
+
+
+```{r, echo=T, warings=F}
+hist(top.table$P.Value, breaks = 100, main = "results P")
+```
+**Comment:** A linear model was fitted to the voom-transformed data, and contrasts were defined to compare conditions (con1, con2, con3). The contrasts were incorporated into the model, and Bayesian adjustment was applied. The resulting model was assessed for mean-variance trends using the plotSA function, which plots the square root of standard deviation against the mean.  Finally, a summary of the differential expression analysis was generated using decideTests, providing information on the number of differentially expressed genes for each contrast. We did not apply multiple comparisons. 
+The histogram represents the  p-values frequency for top genes falling within different p-value bins. The peak towards zero (left-skewed) suggests a substantial number of genes with low p-values corresponds to genes with differential expression and proper distribution. 
+
+**Volcano plot**
+
+```{r, echo=T, warings=F, fig.width=6, fig.height=4, out.width='100%', fig.align='center'}
+# Volcano plot
+colorS <- c("UP" = "red", "DN" = "blue", "n.s" = "black")
+showGenes <- 20
+
+# 'fite' is DESeqDataSet object
+dataV1 <- topTable(fite, n = Inf, coef = "con1", adjust = "fdr")
+
+dataV1 <- dataV1 %>% 
+  mutate(sig = ifelse(P.Value < 0.01 & logFC > 1, "UP", ifelse(P.Value < 0.01 & logFC < (-1), "DN", "n.s")))
+
+p <- ggplot(data = dataV1, aes(x = logFC, y = -log10(P.Value))) +
+  geom_point(alpha = 1, size = 1, aes(col = sig)) +
+  scale_color_manual(values = colorS) +
+  xlab(expression("log"[2] * "FC")) + ylab(expression("-log"[10] * "(p.val)")) +
+  labs(col = " ") +
+  geom_vline(xintercept = 1, linetype = "dotted") +
+  geom_vline(xintercept = -1, linetype = "dotted") +
+  geom_hline(yintercept = -log10(0.1), linetype = "dotted") +
+  theme_bw()
+
+p <- p + geom_text_repel(
+  data = head(dataV1[dataV1$sig != "n.s", ], showGenes),
+  aes(label = ID),  # hgnc_symbol instead of gene
+  max.overlaps = Inf
+)
+
+print(p)
+
+```
+
+```{r, echo=T, warings=F, fig.width=6, fig.height=4, out.width='100%', fig.align='center'}
+# Volcano plot
+colorS <- c("UP" = "red", "DN" = "blue", "n.s" = "black")
+showGenes <- 20
+
+# 'fite' is DESeqDataSet object
+dataV2 <- topTable(fite, n = Inf, coef = "con2", adjust = "fdr")
+
+dataV2 <- dataV2 %>% 
+  mutate(sig = ifelse(P.Value < 0.01 & logFC > 1, "UP", ifelse(P.Value < 0.01 & logFC < (-1), "DN", "n.s")))
+
+p <- ggplot(data = dataV2, aes(x = logFC, y = -log10(P.Value))) +
+  geom_point(alpha = 1, size = 1, aes(col = sig)) +
+  scale_color_manual(values = colorS) +
+  xlab(expression("log"[2] * "FC")) + ylab(expression("-log"[10] * "(p.val)")) +
+  labs(col = " ") +
+  geom_vline(xintercept = 1, linetype = "dotted") +
+  geom_vline(xintercept = -1, linetype = "dotted") +
+  geom_hline(yintercept = -log10(0.1), linetype = "dotted") +
+  theme_bw()
+
+p <- p + geom_text_repel(
+  data = head(dataV2[dataV2$sig != "n.s", ], showGenes),
+  aes(label = ID),  # hgnc_symbol instead of gene
+  max.overlaps = Inf
+)
+
+print(p)
+```
+
+```{r, echo=T, warings=F, fig.width=6, fig.height=4, out.width='100%', fig.align='center'}
+# Volcano plot
+colorS <- c("UP" = "red", "DN" = "blue", "n.s" = "black")
+showGenes <- 20
+
+# 'fite' is DESeqDataSet object
+dataV3 <- topTable(fite, n = Inf, coef = "con3", adjust = "fdr")
+
+dataV3 <- dataV3 %>% 
+  mutate(sig = ifelse(P.Value < 0.01 & logFC > 1, "UP", ifelse(P.Value < 0.01 & logFC < (-1), "DN", "n.s")))
+
+p <- ggplot(data = dataV3, aes(x = logFC, y = -log10(P.Value))) +
+  geom_point(alpha = 1, size = 1, aes(col = sig)) +
+  scale_color_manual(values = colorS) +
+  xlab(expression("log"[2] * "FC")) + ylab(expression("-log"[10] * "(p.val)")) +
+  labs(col = " ") +
+  geom_vline(xintercept = 1, linetype = "dotted") +
+  geom_vline(xintercept = -1, linetype = "dotted") +
+  geom_hline(yintercept = -log10(0.1), linetype = "dotted") +
+  theme_bw()
+
+p <- p + geom_text_repel(
+  data = head(dataV3[dataV3$sig != "n.s", ], showGenes),
+  aes(label = ID),  # hgnc_symbol instead of gene
+  max.overlaps = Inf
+)
+
+print(p)
+```
+**Comment:**The volcano plot offers a comprehensive visualization of differential expression results, presenting both the fold change and statistical significance of genes across conditions. In our case, we produced 3 plots for 20 top genes according to three conditions (different strains of M. tuberculosis) with p.value < 0.01 (highlight = 20), potentially indicating genes of particular interest or significance in TB infection. It can be seen that "UP"  are represented in red, "DN" in blue, and "n.s" in gray.
+
+
+
+**Heatmaps**
+
+```{r, echo=T, warings=F, fig.width=7, fig.height=8, out.width='100%', fig.align='center'}
+#Heatmap
+t1 <- limma::topTable(fite, n = Inf, coef = "con1", adjust = "fdr")
+res1 <- t1[t1$P.Value<0.01 & abs(t1$logFC) > 1,]
+
+top_genes <- res1[res1$P.Value < 0.01 & abs(res1$logFC) > 1, ]
+
+# Select the top 20 most significant genes
+top20_genes <- head(top_genes, 20)
+
+data.clus1 <- countsTMM[rownames(countsTMM) %in% top20_genes$ID, ]
+
+#to change column names
+custom_sample_names <- c(
+  "Control_1 Read Count", "Control_2 Read Count", "Control_3 Read Count", 
+  "H37Rv_1 Read Count", 'H37Rv_2 Read Count', 'H37Rv_3 Read Count', 
+  'H37Ra_1 Read Count', 'H37Ra_2 Read Count', 'H37Ra_3 Read Count', 
+  'BCG_1 Read Count', 'BCG_2 Read Count', 'BCG_3 Read Count'
+)
+
+# Update column names without 'Read Count'
+colnames(data.clus1) <- sub(" Read Count", "", custom_sample_names)
+
+# Create a data frame for conditions
+cond.df <- as.data.frame(cond)
+rownames(cond.df) <- colnames(data.clus1)
+
+# Set up pheatmap parameters
+pheatmap(
+  data.clus1,
+  scale = "row",
+  show_rownames = TRUE,
+  annotation_col = cond.df,
+  
+)
+
+```
+
+```{r, echo=T, warings=F, fig.width=7, fig.height=8, out.width='100%', fig.align='center' }
+#Heatmap
+t2 <- topTable(fite, n = Inf, coef = "con2", adjust = "fdr")
+res2 <- t2[t2$P.Value<0.01 & abs(t2$logFC) > 1,]
+
+top_genes2 <- res2[res2$P.Value < 0.01 & abs(res2$logFC) > 1, ]
+
+# Select the top 20 most significant genes
+top20_genes2 <- head(top_genes2, 20)
+
+data.clus2 <- countsTMM[rownames(countsTMM) %in% top20_genes2$ID, ]
+
+#to change column names
+custom_sample_names <- c(
+  "Control_1 Read Count", "Control_2 Read Count", "Control_3 Read Count", 
+  "H37Rv_1 Read Count", 'H37Rv_2 Read Count', 'H37Rv_3 Read Count', 
+  'H37Ra_1 Read Count', 'H37Ra_2 Read Count', 'H37Ra_3 Read Count', 
+  'BCG_1 Read Count', 'BCG_2 Read Count', 'BCG_3 Read Count'
+)
+
+# Update column names without 'Read Count'
+colnames(data.clus2) <- sub(" Read Count", "", custom_sample_names)
+
+# Create a data frame for conditions
+cond.df <- as.data.frame(cond)
+rownames(cond.df) <- colnames(data.clus2)
+
+# Set up pheatmap parameters
+pheatmap(
+  data.clus2,
+  scale = "row",
+  show_rownames = TRUE,
+  annotation_col = cond.df,
+  
+  
+)
+```
+
+
+
+```{r, echo=T, warings=F, fig.width=7, fig.height=8, out.width='100%', fig.align='center' }
+#Heatmap
+t3 <- topTable(fite, n = Inf, coef = "con3", adjust = "fdr")
+res3 <- t3[t3$P.Value<0.01 & abs(t3$logFC) > 1,]
+
+top_genes3 <- res3[res3$P.Value < 0.01 & abs(res3$logFC) > 1, ]
+
+# Select the top 20 most significant genes
+top20_genes3 <- head(top_genes3, 20)
+
+data.clus3 <- countsTMM[rownames(countsTMM) %in% top20_genes3$ID, ]
+
+#to change column names
+custom_sample_names <- c(
+  "Control_1 Read Count", "Control_2 Read Count", "Control_3 Read Count", 
+  "H37Rv_1 Read Count", 'H37Rv_2 Read Count', 'H37Rv_3 Read Count', 
+  'H37Ra_1 Read Count', 'H37Ra_2 Read Count', 'H37Ra_3 Read Count', 
+  'BCG_1 Read Count', 'BCG_2 Read Count', 'BCG_3 Read Count'
+)
+
+# Update column names without 'Read Count'
+colnames(data.clus3) <- sub(" Read Count", "", custom_sample_names)
+
+# Create a data frame for conditions
+cond.df <- as.data.frame(cond)
+rownames(cond.df) <- colnames(data.clus3)
+
+# Set up pheatmap parameters
+pheatmap(
+  data.clus3,
+  scale = "row",
+  show_rownames = TRUE,
+  annotation_col = cond.df,
+  
+  
+)
+```
+
+
+**Comment:** Heatmaps are frequently used to grasp patterns of gene expression and to observe how these patterns vary across experimental conditions. Here, we generate heatmaps based on the expression levels of the top 20 most significant genes (p < 0.01) identified in a differential expression analysis. Each row corresponds to a gene, and each column corresponds to a sample. The color intensity represents the expression level of each gene, with a color scale indicating high or low expression. The row names (gene names) are displayed on the side. The column annotations provide information about the conditions of the samples. For our example, changing the conditions in the cond variable affects the appearance of the heatmap as the gene expression patterns are not similar across different conditions.
+
+
+# **References**
+Dataset Link:
+Pu, W., Zhao, C., Wazir, J., Su, Z., Niu, M., Song, S., ... Wang, H. (2021). Comparative transcriptomic analysis of THP-1-derived macrophages infected with Mycobacterium tuberculosis H37Rv, H37Ra and BCG. Gene Expression Omnibus (GEO) accession GSE162729.
+
+Journal Article:
+Pu, W., Zhao, C., Wazir, J., Su, Z., Niu, M., Song, S., ... Wang, H. (2021). Comparative transcriptomic analysis of THP-1-derived macrophages infected with Mycobacterium tuberculosis H37Rv, H37Ra and BCG. Journal of Cell and Molecular Medicine, 25(22), 10504-10520. https://doi.org/10.1111/jcmm.16980.
+
+Tutorial:
+Nonell, L. (2023) 'RNA-seq data analysis', Tutorial for master's students in Omics Data Analysis at UVIC-UCC. Available at: https://aules.uvic.cat/pluginfile.php/1578837/mod_resource/content/3/RNAseq.html (Accessed: [17 Dec 2023 ]).
+
